@@ -1,7 +1,7 @@
 ## generate_charts.R
 ## Runs all analysis and saves plots as PNGs for the README
 
-setwd("E:/CC/projects/cfpb-complaint-classifier")
+setwd("E:/CC/cfpb-complaint-classifier")
 
 CFPB <- read.csv("CFPB_Complaints.csv")
 
@@ -28,12 +28,13 @@ v   <- sort(rowSums(m), decreasing = TRUE)
 df  <- data.frame(word = names(v), freq = v, row.names = NULL)
 df  <- subset(df, !grepl("^x+$", df$word))
 
-png("charts/01_wordcloud.png", width = 800, height = 600, res = 120)
+png("charts/01_wordcloud.png", width = 900, height = 700, res = 120)
+par(mar = c(0, 0, 3, 0))
 set.seed(42)
 wordcloud(words = df$word, freq = df$freq, min.freq = 20,
-          max.words = 100, random.order = FALSE, rot.per = 0.30,
-          colors = brewer.pal(8, "Dark2"))
-title(main = "Most Frequent Words in CFPB Complaints", cex.main = 1)
+          max.words = 100, random.order = FALSE, rot.per = 0.25,
+          colors = brewer.pal(8, "Dark2"), scale = c(4, 0.5))
+title(main = "Most Frequent Words in CFPB Complaints", cex.main = 1.2, line = 1)
 dev.off()
 cat("Chart 1 done\n")
 
@@ -68,10 +69,11 @@ cat("Chart 2 done\n")
 
 # Chart 3: Pruned raw tree
 pruned_tree <- prune.misclass(tree_model, best = optimal_size)
-png("charts/03_pruned_raw_tree.png", width = 1000, height = 700, res = 120)
+png("charts/03_pruned_raw_tree.png", width = 1600, height = 1000, res = 130)
+par(mar = c(2, 2, 4, 2))
 plot(pruned_tree)
-text(pruned_tree, pretty = 0, cex = 0.75)
-title(main = "Pruned Decision Tree — Raw Embedding Features")
+text(pruned_tree, pretty = 0, cex = 0.62, col = "#2E4057")
+title(main = "Pruned Decision Tree — Raw Embedding Features", cex.main = 1.1)
 dev.off()
 cat("Chart 3 done\n")
 
@@ -187,16 +189,21 @@ dev.off()
 cat("Chart 8 done\n")
 
 # Chart 9: PCA scatter plot (PC1 vs PC2)
-colors_map <- c(credit_report = "#2E4057", fraud = "#C9A86A", mortgage = "#5A8FA3")
+colors_map <- c(credit_report = "#2E4057", fraud = "#E07B39", mortgage = "#3A9E82")
 point_colors <- colors_map[as.character(CFPB_train$issue)]
-png("charts/09_pca_scatter.png", width = 800, height = 600, res = 120)
+png("charts/09_pca_scatter.png", width = 950, height = 680, res = 130)
+par(mar = c(5, 5, 4, 2))
 plot(pca_result$x[, 1], pca_result$x[, 2],
-     col = point_colors, pch = 16, cex = 0.6, alpha = 0.5,
+     col = adjustcolor(point_colors, alpha.f = 0.55),
+     pch = 16, cex = 0.65,
      xlab = "Principal Component 1",
      ylab = "Principal Component 2",
      main = "PCA of OpenAI Embeddings — Colored by Complaint Category")
-legend("topright", legend = names(colors_map),
-       col = colors_map, pch = 16, pt.cex = 1.2, bty = "n")
+legend("bottomright",
+       legend = c("Credit Report", "Fraud", "Mortgage"),
+       col = colors_map, pch = 16, pt.cex = 1.4,
+       bty = "o", bg = "white", box.col = "grey80",
+       cex = 0.95, y.intersp = 1.3)
 dev.off()
 cat("Chart 9 done\n")
 

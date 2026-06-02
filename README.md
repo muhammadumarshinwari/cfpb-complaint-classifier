@@ -1,149 +1,125 @@
-# CFPB Complaint Classification
+# CFPB Consumer Complaint Classifier
 
-This project classifies consumer financial complaints from the CFPB (Consumer Financial Protection Bureau) into one of three categories using OpenAI text embeddings and decision trees in R. The question is simple: given the text of a complaint, can a model figure out what it is about?
+The Consumer Financial Protection Bureau (CFPB) is a US government agency that collects complaints from people who have problems with financial products like mortgages, credit cards, and bank accounts. Those complaints are published publicly in a database.
+
+This project takes 3,000 of those complaints and tries to automatically classify each one into the correct category using a decision tree. The three categories are mortgage complaints, credit report complaints, and fraud complaints. The interesting part is comparing two approaches: feeding the raw text features directly into the tree vs first compressing them with PCA and then training the tree. PCA cuts the error rate from 12.2% down to 3.3%.
 
 ---
 
-## Data
+## The Data
 
-3,000 complaints, 1,000 per category:
+3,000 complaints pulled from the public CFPB database, 1,000 per category:
 
-| Category | Count | What these look like |
-|---|---|---|
-| `mortgage` | 1,000 | Escrow disputes, servicer issues, refinance problems |
-| `credit_report` | 1,000 | Incorrect entries, identity disputes, FCRA violations |
-| `fraud` | 1,000 | Unauthorized charges, account takeovers, scams |
-
-Each complaint was passed through OpenAI's embedding model before this analysis. The model converts the raw text into a 1,536-dimensional numeric vector. The decision trees in this project train on those vectors, not on the raw text.
-
-| | |
+| Category | What these complaints are about |
 |---|---|
-| Total complaints | 3,000 |
-| Embedding dimensions | 1,536 |
-| Average complaint length | 143 tokens |
-| Min / Max tokens | 70 / 279 |
+| `mortgage` | Escrow disputes, servicer problems, refinancing issues, foreclosure |
+| `credit_report` | Incorrect entries on credit reports, identity disputes, FCRA violations |
+| `fraud` | Unauthorized charges, account takeovers, scam transactions |
+
+The raw complaint text is not used directly as input to the model. Instead, each complaint was first passed through OpenAI's text embedding model, which converts the words into a list of 1,536 numbers. Think of it as translating each complaint into a point in a very high-dimensional space where complaints that are about similar things end up close to each other. The decision trees in this project train on those numbers, not on the original text.
 
 ---
 
-## Step 0: Word Cloud
+## Word Cloud
 
-A word cloud of the most common terms across all 3,000 complaints. CFPB redacts personal information with strings like XXXX, so those were removed along with standard English stopwords.
-
-```r
-corpus <- Corpus(VectorSource(CFPB$message))
-corpus <- tm_map(corpus, content_transformer(tolower))
-corpus <- tm_map(corpus, removePunctuation)
-corpus <- tm_map(corpus, removeNumbers)
-corpus <- tm_map(corpus, removeWords, stopwords("english"))
-corpus <- tm_map(corpus, removeWords, c("xxxx", "xxx", "xx"))
-corpus <- tm_map(corpus, stripWhitespace)
-```
+Before any modeling, it helps to just look at what words appear most often across all 3,000 complaints. Common stopwords and CFPB's placeholder strings (like XXXX used to redact account numbers) were removed first.
 
 ![Word Cloud](charts/01_wordcloud.png)
 
-Words like *account*, *report*, *received*, and *told* come up a lot. They are generic enough to appear in all three complaint types, which is part of why a bag-of-words approach would not discriminate well between categories.
+Words like *consumer*, *information*, *report*, *section*, and *mortgage* dominate. These are broad enough to appear in all three complaint types, which is actually a hint that a simple word-counting approach would not separate the categories well. The embedding model captures meaning rather than just word frequency, which is why it works better.
 
 ---
 
 ## Step 1: Decision Tree on Raw Embedding Features
 
-The simplest approach: use all 1,536 embedding dimensions as features and train a decision tree directly on them. 80% of the data goes to training, 20% to testing.
+The simplest starting point. Take all 1,536 embedding dimensions and feed them directly into a decision tree. The data is split 80% for training and 20% for testing.
 
-```r
-set.seed(1)
-trainindex <- sample(nrow(CFPB), size = 0.8 * nrow(CFPB))
-CFPB_train <- CFPB[trainindex, ]
-CFPB_test  <- CFPB[-trainindex, ]
+The tree is first grown fully, then pruned using cross-validation to find the size that minimizes misclassification error on held-out data. The chart below shows how error changes as tree size increases.
 
-tree_model <- tree(issue ~ ., data = CFPB_train)
-```
-
-Cross-validation to find the right tree size, then prune:
-
-```r
-cv_results   <- cv.tree(tree_model, FUN = prune.misclass)
-optimal_size <- cv_results$size[which.min(cv_results$dev)]
-pruned_tree  <- prune.misclass(tree_model, best = optimal_size)
-```
+**Cross-validation curve:**
 
 ![CV Raw Tree](charts/02_cv_raw_tree.png)
 
+The error bottoms out and then starts creeping back up as the tree gets too large and starts memorizing the training data rather than learning general patterns. The dashed line marks the optimal size.
+
+**The pruned tree:**
+
 ![Pruned Raw Tree](charts/03_pruned_raw_tree.png)
+
+Each internal node shows a split condition like `X746 < -0.00184`. These variable names (X746, X1071, etc.) refer to specific dimensions in the 1,536-dimensional embedding space. They do not have human-readable names because embeddings are not designed to be interpretable that way — each dimension is a learned combination of patterns across thousands of words.
+
+**Confusion matrix:**
 
 ![Confusion Matrix Raw](charts/04_confusion_raw.png)
 
-**Raw features tree results:**
+Reading the confusion matrix: the diagonal shows correct predictions. Off-diagonal cells are mistakes. Fraud is the hardest category — 42 out of 201 fraud complaints get misclassified, mostly confused with mortgage or credit report. That is a 20.9% fraud miss rate.
+
+**Raw features results:**
 - Overall error rate: **12.2%**
-- Fraud miss rate: **20.9%** (about 1 in 5 fraud complaints get misclassified)
+- Fraud miss rate: **20.9%** — about 1 in 5 fraud complaints get incorrectly classified
+
+---
+
+## Why 1,536 Features is a Problem
+
+A decision tree works by finding the best split at each node. With 1,536 dimensions to choose from, many of which are highly correlated (similar embedding dimensions tend to move together), the tree wastes splits on noisy or redundant features. It ends up making many small distinctions that do not generalize to new data.
+
+The fix is to compress the 1,536 dimensions down to a smaller set of dimensions that capture most of the useful variation. That is what PCA does.
 
 ---
 
 ## Step 2: PCA, then Decision Tree
 
-1,536 features is a lot of correlated dimensions for a single tree to work through. PCA compresses them into a smaller set of uncorrelated components. The cutoff used here is 50% of total variance explained.
+PCA (Principal Component Analysis) takes the 1,536 embedding dimensions and creates a new set of dimensions called principal components. Each principal component is a direction in the data that captures as much variation as possible, and they are uncorrelated with each other by construction. You can then keep only the first N components that together explain enough of the total variance.
 
-```r
-pca_result     <- prcomp(embedding_features, center = TRUE, scale = TRUE)
-PVE            <- pca_result$sdev^2 / sum(pca_result$sdev^2)
-num_components <- which(cumsum(PVE) >= 0.5)[1]  # 29 components
-```
+The chart below shows how many components are needed to reach 50% of the total variance explained:
 
 ![PCA Variance](charts/05_pca_variance.png)
 
-29 components get us to 50% of the variance. The tree then trains on those 29 features.
+The curve flattens quickly. Just 29 components out of 1,536 get us to 50% of the variance. This means most of the information in the original 1,536 dimensions can be summarized in 29 numbers. The rest is mostly noise.
 
-```r
-train_pca <- data.frame(
-  issue = CFPB_train$issue,
-  pca_result$x[, 1:num_components]
-)
-tree_pca        <- tree(issue ~ ., data = train_pca)
-pruned_tree_pca <- prune.misclass(tree_pca, best = optimal_size_pca)
-```
+**Cross-validation on PCA features:**
 
 ![CV PCA Tree](charts/06_cv_pca_tree.png)
 
+The PCA tree converges to a much lower error faster and stays there. The optimal tree is also simpler.
+
+**The pruned PCA tree:**
+
 ![Pruned PCA Tree](charts/07_pruned_pca_tree.png)
+
+This tree is far simpler than the raw one. It only needs two splits: first on PC1 (the single most important direction in the embedding space), then on PC2. If PC1 is below a threshold, the complaint is classified as credit report. If not, PC2 determines whether it is fraud or mortgage. Clean and interpretable.
+
+**Confusion matrix:**
 
 ![Confusion Matrix PCA](charts/08_confusion_pca.png)
 
-**PCA tree results:**
+Almost everything lands on the diagonal. Mortgage complaints in particular are perfectly classified — 200 out of 200. Fraud misses drop from 42 to just 8.
+
+**PCA results:**
 - Overall error rate: **3.3%**
-- Fraud miss rate: **4.0%** (about 1 in 25)
-
----
-
-## Results
-
-| Model | Overall Error | Fraud Miss Rate |
-|---|---|---|
-| Tree on raw embeddings (1,536 features) | 12.2% | 20.9% |
-| Tree on PCA features (29 components) | **3.3%** | **4.0%** |
-
-PCA reduces error by about 4x. With 1,536 correlated features, the tree wastes splits on noise. Reducing to 29 orthogonal components gives it cleaner signal to work with.
+- Fraud miss rate: **4.0%** — about 1 in 25
 
 ---
 
 ## PCA Scatter Plot
 
-PC1 vs PC2, colored by complaint category. The three groups separate fairly well in this space, which explains why the PCA tree performs so much better.
+Plotting the first two principal components and coloring by category shows why PCA works so well here. The three groups are already fairly well separated in just two dimensions.
 
 ![PCA Scatter](charts/09_pca_scatter.png)
 
+Credit report complaints (dark blue) cluster to the left along PC1. Mortgage (teal) and fraud (orange) sit to the right but split along PC2 — mortgage goes up, fraud goes down. That structure is exactly what the simple two-split PCA tree is exploiting.
+
 ---
 
-## How to Reproduce
+## Results Summary
 
-1. Clone the repo and place `CFPB_Complaints.csv` in the root directory.
-2. Install packages:
+| Model | Features Used | Overall Error | Fraud Miss Rate |
+|---|---|---|---|
+| Decision tree on raw embeddings | 1,536 dimensions | 12.2% | 20.9% |
+| Decision tree on PCA features | 29 components | **3.3%** | **4.0%** |
 
-```r
-install.packages(c("tm", "wordcloud", "tree"))
-```
-
-3. Run `generate_charts.R` to save all plots, then `cfpb_classification.R` for the full analysis output.
-
-**R version:** 4.3+
+Reducing from 1,536 correlated dimensions to 29 uncorrelated ones cuts the error rate by roughly 4x. The PCA tree is also much simpler and easier to understand — two splits instead of a deep branching structure.
 
 ---
 
@@ -151,9 +127,9 @@ install.packages(c("tm", "wordcloud", "tree"))
 
 ```
 cfpb-complaint-classifier/
-├── cfpb_classification.R     # full analysis
-├── generate_charts.R         # saves charts as PNGs
-├── charts/                   # chart output
+├── cfpb_classification.R      full analysis with model outputs
+├── generate_charts.R          saves all charts as PNGs
+├── charts/
 │   ├── 01_wordcloud.png
 │   ├── 02_cv_raw_tree.png
 │   ├── 03_pruned_raw_tree.png
@@ -166,4 +142,12 @@ cfpb-complaint-classifier/
 └── README.md
 ```
 
-`CFPB_Complaints.csv` is not in the repo (56 MB). The raw complaint data is publicly available through the CFPB complaint database.
+`CFPB_Complaints.csv` is not in the repo. The raw complaint data is publicly available through the [CFPB complaint database](https://www.consumerfinance.gov/data-research/consumer-complaints/).
+
+## How to Run
+
+```r
+install.packages(c("tm", "wordcloud", "tree"))
+# Then run generate_charts.R to produce the charts
+# Then run cfpb_classification.R for the full model output
+```
