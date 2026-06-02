@@ -16,23 +16,20 @@ The dataset contains 3,000 complaints, evenly split across three categories:
 
 Each complaint was passed through OpenAI's text embedding model, which converts the raw text into a 1,536-dimensional numeric vector. These embedding features are what the models actually train on — the raw text is not used directly in the tree models.
 
-**A few numbers on the text:**
-- Average complaint length: 143 tokens
-- Shortest complaint: 70 tokens
-- Longest complaint: 279 tokens
+| Metric | Value |
+|---|---|
+| Total complaints | 3,000 |
+| Embedding dimensions | 1,536 |
+| Average complaint length | 143 tokens |
+| Min / Max tokens | 70 / 279 |
 
 ---
 
-## Approach
+## Step 0 — Word Cloud
 
-### Step 0 — Word Cloud
-
-Before modeling, a word cloud was built to see which terms appear most often across all 3,000 complaints. Standard pre-processing was applied: lowercase conversion, punctuation and number removal, English stopwords, and redaction tokens (XXXX, XXX) that CFPB uses to anonymize personal data.
+Before modeling, a word cloud was built to see which terms appear most often across all 3,000 complaints. Standard pre-processing: lowercase conversion, punctuation and number removal, English stopwords, and CFPB redaction tokens (XXXX).
 
 ```r
-library(tm)
-library(wordcloud)
-
 corpus <- Corpus(VectorSource(CFPB$message))
 corpus <- tm_map(corpus, content_transformer(tolower))
 corpus <- tm_map(corpus, removePunctuation)
@@ -40,17 +37,17 @@ corpus <- tm_map(corpus, removeNumbers)
 corpus <- tm_map(corpus, removeWords, stopwords("english"))
 corpus <- tm_map(corpus, removeWords, c("xxxx", "xxx", "xx"))
 corpus <- tm_map(corpus, stripWhitespace)
-
-tdm <- TermDocumentMatrix(corpus)
 ```
 
-Common terms: *account*, *report*, *information*, *received*, *time*, *told* — fairly generic, which is why the raw text alone does not discriminate cleanly between categories without embedding.
+![Word Cloud](charts/01_wordcloud.png)
+
+Common terms like *account*, *report*, *received*, and *told* dominate — fairly generic vocabulary shared across all three complaint types, which is why raw text frequency alone does not separate categories cleanly.
 
 ---
 
-### Step 1 — Decision Tree on Raw Embedding Features
+## Step 1 — Decision Tree on Raw Embedding Features
 
-The 1,536 embedding dimensions were used directly as features. The data was split 80/20 into training and test sets.
+The 1,536 embedding dimensions were used directly as features in an 80/20 train/test split.
 
 ```r
 set.seed(1)
@@ -58,92 +55,95 @@ trainindex <- sample(nrow(CFPB), size = 0.8 * nrow(CFPB))
 CFPB_train <- CFPB[trainindex, ]
 CFPB_test  <- CFPB[-trainindex, ]
 
-# Remove message and num_tokens columns
-CFPB_train <- CFPB_train[, -c(1, 3)]
-CFPB_test  <- CFPB_test[, -c(1, 3)]
-
 tree_model <- tree(issue ~ ., data = CFPB_train)
 ```
 
-Cross-validation was used to find the optimal number of terminal nodes, and the tree was pruned accordingly.
+Cross-validation was used to find the optimal number of terminal nodes before pruning.
 
 ```r
-cv_results  <- cv.tree(tree_model, FUN = prune.misclass)
+cv_results   <- cv.tree(tree_model, FUN = prune.misclass)
 optimal_size <- cv_results$size[which.min(cv_results$dev)]
 pruned_tree  <- prune.misclass(tree_model, best = optimal_size)
 ```
 
+![CV Raw Tree](charts/02_cv_raw_tree.png)
+
+![Pruned Raw Tree](charts/03_pruned_raw_tree.png)
+
+![Confusion Matrix Raw](charts/04_confusion_raw.png)
+
+**Results — Raw Features Tree:**
+- Overall error rate: **12.2%**
+- Fraud miss rate: **20.9%** (roughly 1 in 5 fraud complaints misclassified)
+
 ---
 
-### Step 2 — PCA, then Decision Tree
+## Step 2 — PCA, then Decision Tree
 
-With 1,536 correlated features, a single decision tree struggles to find meaningful splits. PCA was applied to the embedding dimensions to extract uncorrelated components, retaining those that together explain at least 50% of the total variance.
+With 1,536 correlated embedding dimensions, the tree struggles to find clean splits. PCA extracts uncorrelated components and keeps those that together explain at least 50% of the total variance.
 
 ```r
-embedding_features <- CFPB_train[, -1]
-pca_result <- prcomp(embedding_features, center = TRUE, scale = TRUE)
+pca_result     <- prcomp(embedding_features, center = TRUE, scale = TRUE)
+PVE            <- pca_result$sdev^2 / sum(pca_result$sdev^2)
+num_components <- which(cumsum(PVE) >= 0.5)[1]  # 29 components
+```
 
-# Cumulative variance
-total_var <- sum(pca_result$sdev^2)
-PVE       <- pca_result$sdev^2 / total_var
-num_components <- which(cumsum(PVE) >= 0.5)[1]
+![PCA Variance](charts/05_pca_variance.png)
 
+29 principal components are enough to capture 50% of the variance in the 1,536-dimensional embedding space. The tree is then trained on these 29 features instead of the original 1,536.
+
+```r
 train_pca <- data.frame(
   issue = CFPB_train$issue,
   pca_result$x[, 1:num_components]
 )
+tree_pca         <- tree(issue ~ ., data = train_pca)
+pruned_tree_pca  <- prune.misclass(tree_pca, best = optimal_size_pca)
 ```
 
-The same cross-validation and pruning procedure was then repeated on the PCA-reduced training set.
+![CV PCA Tree](charts/06_cv_pca_tree.png)
+
+![Pruned PCA Tree](charts/07_pruned_pca_tree.png)
+
+![Confusion Matrix PCA](charts/08_confusion_pca.png)
+
+**Results — PCA Features Tree:**
+- Overall error rate: **3.3%**
+- Fraud miss rate: **4.0%** (roughly 1 in 25)
 
 ---
 
-## Results
+## Results Summary
 
-| Model | Overall Error Rate | Fraud Miss Rate |
+| Model | Overall Error | Fraud Miss Rate |
 |---|---|---|
-| Tree on raw embeddings | 12.2% | 20.9% |
-| Tree on PCA features | **3.3%** | **4.0%** |
+| Tree on raw embeddings (1,536 features) | 12.2% | 20.9% |
+| Tree on PCA features (29 components) | **3.3%** | **4.0%** |
 
-The PCA tree cuts the overall error rate by roughly 4x and reduces the fraud miss rate from 1-in-5 to about 1-in-25. The improvement comes from dimensionality reduction: the tree can now split on directions that capture genuine variance in the data rather than trying to navigate 1,536 correlated axes one at a time.
+PCA cuts the overall error by roughly 4x. The improvement comes from dimensionality reduction: rather than navigating 1,536 correlated axes, the tree splits on 29 orthogonal directions that capture the genuine structure in the embedding space.
 
 ---
 
-## Charts
+## PCA Scatter Plot
 
-**1. Word Cloud**
-Most frequent terms after stopword removal. Redaction tokens (XXXX) are excluded. Dominated by service and account-related vocabulary shared across all three complaint types.
+The first two principal components plotted against each other, colored by complaint category. Visible separation between the three types confirms that the embedding space does encode meaningful differences between mortgage, credit report, and fraud complaints.
 
-**2. Cross-Validation — Raw Features Tree**
-Misclassification deviance plotted against tree size. Used to identify the optimal number of terminal nodes before pruning.
-
-**3. Pruned Tree — Raw Features**
-Final tree structure after pruning to the optimal size selected by cross-validation.
-
-**4. Cross-Validation — PCA Tree**
-Same procedure applied to the PCA feature set. Noticeably lower deviance at the optimum compared to the raw features tree.
-
-**5. Pruned Tree — PCA Features**
-Final PCA tree. Cleaner structure than the raw features tree — fewer splits needed to achieve much lower error.
-
-**6. PCA Scatter Plot**
-Training observations plotted on the first two principal components, colored by issue category. Shows visible separation between the three complaint types in the PCA space, which explains why the PCA tree performs well.
+![PCA Scatter](charts/09_pca_scatter.png)
 
 ---
 
 ## How to Reproduce
 
-1. Clone the repo and open `cfpb_classification.R` in RStudio.
-2. Make sure `CFPB_Complaints.csv` is in the same directory.
-3. Install the required packages if not already present:
+1. Clone the repo and place `CFPB_Complaints.csv` in the root directory.
+2. Install packages if needed:
 
 ```r
 install.packages(c("tm", "wordcloud", "tree"))
 ```
 
-4. Run the script top to bottom. Each `dev.new()` call opens a new plot window.
+3. Run `generate_charts.R` to produce all charts, then `cfpb_classification.R` for the full analysis.
 
-**R version used:** 4.3+  
+**R version:** 4.3+  
 **Key packages:** `tm`, `wordcloud`, `tree`
 
 ---
@@ -153,6 +153,18 @@ install.packages(c("tm", "wordcloud", "tree"))
 ```
 cfpb-complaint-classifier/
 ├── cfpb_classification.R     # full analysis script
-├── CFPB_Complaints.csv       # complaint text + OpenAI embeddings (3,000 rows x 1,539 cols)
+├── generate_charts.R         # saves all plots as PNGs
+├── charts/                   # generated chart images
+│   ├── 01_wordcloud.png
+│   ├── 02_cv_raw_tree.png
+│   ├── 03_pruned_raw_tree.png
+│   ├── 04_confusion_raw.png
+│   ├── 05_pca_variance.png
+│   ├── 06_cv_pca_tree.png
+│   ├── 07_pruned_pca_tree.png
+│   ├── 08_confusion_pca.png
+│   └── 09_pca_scatter.png
 └── README.md
 ```
+
+> `CFPB_Complaints.csv` is excluded from the repo due to file size (56 MB). The dataset can be sourced from the CFPB public complaints database.
